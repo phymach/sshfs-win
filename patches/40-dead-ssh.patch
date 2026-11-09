@@ -1,0 +1,232 @@
+--- a/sshfs.c
++++ b/sshfs.c
+@@ -34,6 +34,7 @@
+ #include <sys/uio.h>
+ #include <sys/types.h>
+ #include <sys/time.h>
++#include <time.h>
+ #include <sys/wait.h>
+ #include <sys/socket.h>
+ #include <sys/utsname.h>
+@@ -216,6 +217,7 @@
+ 	int processing_thread_started;
+ 	int rfd;
+ 	int wfd;
++	pid_t ssh_pid;
+ 	int connver;
+ 	int req_count;
+ 	int dir_count;
+@@ -340,6 +342,7 @@
+ 	int verbose;
+ 	int foreground;
+ 	int reconnect;
++	unsigned reply_timeout;
+ 	int delay_connect;
+ 	int passive;
+ 	char *host;
+@@ -505,6 +508,7 @@
+ 	SSHFS_OPT("dir_cache=no",  dir_cache, 0),
+ 	SSHFS_OPT("direct_io",  direct_io, 1),
+ 	SSHFS_OPT("max_conns=%u",  max_conns, 1),
++	SSHFS_OPT("reply_timeout=%u", reply_timeout, 0),
+ 
+ 	SSHFS_OPT("-h",		show_help, 1),
+ 	SSHFS_OPT("--help",	show_help, 1),
+@@ -1182,15 +1186,13 @@
+ 		close(sockpair[0]);
+ 		close(sockpair[1]);
+ 
+-		switch (fork()) {
+-		case -1:
+-			perror("failed to fork");
+-			_exit(1);
+-		case 0:
+-			break;
+-		default:
+-			_exit(0);
+-		}
++		/*
++		 * Stay a direct child of sshfs (no double fork) so that
++		 * sshfs knows the pid and can kill ssh when it tears the
++		 * connection down. Otherwise an ssh that hangs instead of
++		 * exiting after the link died keeps the socket pair open,
++		 * sshfs never sees EOF and never reconnects.
++		 */
+ 		chdir("/");
+ 		/*
+ 		 * Avoid processes hanging trying to stat() OLDPWD if it is in
+@@ -1235,7 +1237,7 @@
+ 			sshfs.ssh_args.argv[0], strerror(errno));
+ 		_exit(1);
+ 	}
+-	waitpid(pid, NULL, 0);
++	conn->ssh_pid = pid;
+ 	close(sockpair[1]);
+ 	return 0;
+ }
+@@ -1364,12 +1366,66 @@
+ 	return res;
+ }
+ 
++static time_t monotonic_seconds(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return ts.tv_sec;
++}
++
++/*
++ * Wait until the server sends something. Give up when requests have been
++ * pending for sshfs.reply_timeout seconds without a single byte arriving.
++ * An idle connection never times out; ssh keepalives take care of that.
++ *
++ * This is the last line of defence against an ssh that neither delivers
++ * replies nor exits: without it every file system operation waits forever
++ * (and Explorer with it), because sshfs only notices a dead connection
++ * when ssh closes its end of the socket pair.
++ *
++ * req_count is read without sshfs.lock, since that lock is held while a
++ * reconnect runs sftp_init.
++ */
++static int wait_for_reply(struct conn *conn)
++{
++	struct pollfd fds;
++	time_t start = monotonic_seconds();
++	int res;
++
++	while (1) {
++		fds.fd = conn->rfd;
++		fds.events = POLLIN;
++		fds.revents = 0;
++		res = poll(&fds, 1, 1000);
++		if (res > 0)
++			return 0;
++		if (res == -1) {
++			if (errno == EINTR)
++				continue;
++			perror("poll");
++			return -1;
++		}
++		if (__atomic_load_n(&conn->req_count, __ATOMIC_RELAXED) == 0) {
++			start = monotonic_seconds();
++			continue;
++		}
++		if (monotonic_seconds() - start >= (time_t) sshfs.reply_timeout) {
++			fprintf(stderr, "no reply from server for %u seconds, "
++				"dropping connection\n", sshfs.reply_timeout);
++			return -1;
++		}
++	}
++}
++
+ static int do_read(struct conn *conn, struct buffer *buf)
+ {
+ 	int res;
+ 	uint8_t *p = buf->p;
+ 	size_t size = buf->size;
+ 	while (size) {
++		if (sshfs.reply_timeout && wait_for_reply(conn) == -1)
++			return -1;
+ 		res = read(conn->rfd, p, size);
+ 		if (res == -1) {
+ 			perror("read");
+@@ -1536,8 +1592,48 @@
+ 	return 0;
+ }
+ 
++#ifdef __CYGWIN__
++static int terminate_win_process(pid_t pid);
++#endif
++
++/*
++ * Make sure the ssh of a dead connection is gone. It normally exits by
++ * itself once the link drops, but if it hangs instead (e.g. while closing
++ * its network socket) it would keep running forever, and a writer blocked
++ * on the full socket pair would never return. Killing it also unblocks
++ * that writer.
++ */
++static void kill_ssh(struct conn *conn)
++{
++	pid_t pid = conn->ssh_pid;
++	pid_t res;
++	int i;
++
++	if (pid <= 0)
++		return;
++	conn->ssh_pid = -1;
++
++	/* not SIGTERM: ssh's own exit path is what may be stuck */
++	kill(pid, SIGKILL);
++	for (i = 0; i < 200; i++) {
++		if (i == 100) {
++			fprintf(stderr, "ssh (pid %d) ignores SIGKILL\n",
++				(int) pid);
++#ifdef __CYGWIN__
++			terminate_win_process(pid);
++#endif
++		}
++		res = waitpid(pid, NULL, WNOHANG);
++		if (res == pid || (res == -1 && errno != EINTR))
++			return;
++		usleep(10000);
++	}
++	fprintf(stderr, "failed to reap ssh (pid %d)\n", (int) pid);
++}
++
+ static void close_conn(struct conn *conn)
+ {
++	kill_ssh(conn);
+ 	close(conn->rfd);
+ 	if (conn->rfd != conn->wfd)
+ 		close(conn->wfd);
+@@ -3632,6 +3728,9 @@
+ "    -1                     equivalent to '-o ssh_protocol=1'\n"
+ "    -o opt,[opt...]        mount options\n"
+ "    -o reconnect           reconnect to server\n"
++"    -o reply_timeout=N     drop the connection if the server sends nothing\n"
++"                           for N seconds while requests are pending\n"
++"                           (default: 0, disabled)\n"
+ "    -o delay_connect       delay connection to server\n"
+ "    -o sshfs_sync          synchronous writes\n"
+ "    -o no_readahead        synchronous reads (no speculative readahead)\n"
+@@ -4355,6 +4454,7 @@
+ 	for (i = 0; i < sshfs.max_conns; i++) {
+ 		sshfs.conns[i].rfd = -1;
+ 		sshfs.conns[i].wfd = -1;
++		sshfs.conns[i].ssh_pid = -1;
+ 	}
+ 
+ 	fsname = g_strdup(sshfs.host);
+@@ -4481,3 +4581,31 @@
+ 
+ 	return res;
+ }
++
++#ifdef __CYGWIN__
++/*
++ * Last resort for kill_ssh(): a Cygwin process handles SIGKILL in its own
++ * signal thread, so one that is wedged inside a Windows call may not die.
++ * TerminateProcess always works. Kept at the end of the file so that the
++ * Windows headers cannot clash with anything above.
++ */
++#include <windows.h>
++#include <sys/cygwin.h>
++
++static int terminate_win_process(pid_t pid)
++{
++	DWORD winpid;
++	HANDLE h;
++	BOOL ok;
++
++	winpid = (DWORD) cygwin_internal(CW_CYGWIN_PID_TO_WINPID, pid);
++	if (winpid == 0)
++		return -1;
++	h = OpenProcess(PROCESS_TERMINATE, FALSE, winpid);
++	if (h == NULL)
++		return -1;
++	ok = TerminateProcess(h, 255);
++	CloseHandle(h);
++	return ok ? 0 : -1;
++}
++#endif
